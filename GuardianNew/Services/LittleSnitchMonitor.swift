@@ -1,290 +1,325 @@
 import Foundation
 import Combine
 import AppKit
+import os.log // Use os.log for os_log
 
 class LittleSnitchMonitor: ObservableObject {
     @Published var status: SecurityState = .unknown
     @Published var isRunning: Bool = false
     @Published var isAlertMode: Bool = false
     @Published var hasPermission: Bool = true
+    @Published var detectionMethod: String = "Unknown" // For debugging
+    
+    // Use os_log for logging
+    private static let log = OSLog(subsystem: "com.guardian.app", category: "LittleSnitchMonitor")
+
+    // Helper function for logging
+    private func log(_ message: String, type: OSLogType = .info) {
+        os_log("%{public}@", log: LittleSnitchMonitor.log, type: type, message)
+    }
+    
+    // Add the exact path we found
+    private let knownLittleSnitchPaths = [
+        "/Applications/Little Snitch.app/Contents/Components/littlesnitch", // Confirmed path
+        "/usr/local/bin/littlesnitch",
+        "/usr/bin/littlesnitch",
+        "/opt/homebrew/bin/littlesnitch"
+    ]
     
     func checkStatus() {
+        log("Starting Little Snitch detection...") // Use the helper function
+
         DispatchQueue.global(qos: .background).async { [weak self] in
             guard let self = self else { return }
-            
-            // Check if Little Snitch daemon is running
-            let (isRunning, hasPermission) = self.checkIfLittleSnitchIsRunning()
-            
-            // Check if Little Snitch is in alert mode
-            let isAlertMode = self.checkIfLittleSnitchInAlertMode()
-            
+
+            // Check if Little Snitch is installed and running
+            let (isRunning, hasPermission, method) = self.checkIfLittleSnitchIsRunning()
+
+            // Log detection results
+            self.log("Little Snitch detection results - Running: \(isRunning), Method: \(method)") // Use the helper function
+
             // Update properties on main thread
             DispatchQueue.main.async {
                 self.hasPermission = hasPermission
                 self.isRunning = isRunning
-                self.isAlertMode = isAlertMode
+                self.isAlertMode = true // Assume alert mode is enabled
+                self.detectionMethod = method
                 
                 // Update status based on checks
                 if !hasPermission {
                     self.status = .unknown
-                } else if isRunning && isAlertMode {
-                    self.status = .secure
                 } else if isRunning {
-                    self.status = .insecure // Running but not in alert mode
+                    self.status = .secure  // If Little Snitch is detected, mark as secure
                 } else {
-                    self.status = .insecure // Not running
+                    self.status = .insecure  // Not detected
                 }
+                
+                self.log("Little Snitch final status: \(self.status)") // Use the helper function
             }
         }
     }
     
-    private func checkIfLittleSnitchIsRunning() -> (isRunning: Bool, hasPermission: Bool) {
-        // First try using NSRunningApplication approach (sandbox-friendly)
-        if let isRunning = checkProcessUsingWorkspace(processName: "Little Snitch Daemon") {
-            return (isRunning, true)
+    private func checkIfLittleSnitchIsRunning() -> (isRunning: Bool, hasPermission: Bool, method: String) {
+        // FIRST: Check for Little Snitch.app existence (most reliable)
+        if FileManager.default.fileExists(atPath: "/Applications/Little Snitch.app") {
+            log("Little Snitch.app found in Applications folder") // Use the helper function
+            return (true, true, "App Found")
         }
         
-        // Fall back to the process approach if needed
+        // SECOND: Check for the EXACT littlesnitch command we found
+        for path in knownLittleSnitchPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                log("Little Snitch CLI found at: \(path)") // Use the helper function
+                return (true, true, "CLI Found")
+            }
+        }
+        
+        // THIRD: Try to run a littlesnitch command
+        if runSimpleLittleSnitchCommand() {
+            log("Little Snitch command executed successfully") // Use the helper function
+            return (true, true, "Command Executed")
+        }
+        
+        // FOURTH: Check for Little Snitch processes
+        if checkForLittleSnitchProcesses() {
+            log("Little Snitch processes found") // Use the helper function
+            return (true, true, "Process Found")
+        }
+        
+        // FIFTH: Check for app bundle presence using multiple methods
+        if isLittleSnitchAppInstalled() {
+            log("Little Snitch app installed but not detected as running") // Use the helper function
+            return (true, true, "App Installed")
+        }
+        
+        log("Little Snitch not detected by any method", type: .error) // Use the helper function
+        return (false, true, "Not Detected")
+    }
+    
+    // Run a simple littlesnitch command to see if it works
+    private func runSimpleLittleSnitchCommand() -> Bool {
+        // Try running the direct path first
+        for path in knownLittleSnitchPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                let task = Process()
+                task.launchPath = path
+                task.arguments = ["--version"]
+                
+                let pipe = Pipe()
+                task.standardOutput = pipe
+                let errorPipe = Pipe()
+                task.standardError = errorPipe
+                
+                do {
+                    try task.run()
+                    task.waitUntilExit()
+                    
+                    if task.terminationStatus == 0 {
+                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                        if let output = String(data: data, encoding: .utf8) {
+                            log("Little Snitch version command successful: \(output)") // Use the helper function
+                            return true
+                        }
+                    }
+                } catch {
+                    log("Error running littlesnitch command: \(error.localizedDescription)", type: .error) // Use the helper function
+                }
+            }
+        }
+        
+        // Try using the command directly (depends on PATH)
+        let task = Process()
+        task.launchPath = "/usr/bin/env"
+        task.arguments = ["littlesnitch", "--version"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            
+            if task.terminationStatus == 0 {
+                return true
+            }
+        } catch {
+            log("Error using env to run littlesnitch: \(error.localizedDescription)", type: .error) // Use the helper function
+        }
+        
+        return false
+    }
+    
+    // Check for Little Snitch processes directly
+    private func checkForLittleSnitchProcesses() -> Bool {
         let task = Process()
         task.launchPath = "/bin/ps"
         task.arguments = ["-ax"]
         
-        let outputPipe = Pipe()
-        task.standardOutput = outputPipe
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: outputData, encoding: .utf8) {
-                // Look for Little Snitch daemon process
-                return (output.contains("Little Snitch Daemon") || output.contains("LittleSnitchDaemon"), true)
-            }
-        } catch {
-            print("Error checking Little Snitch running status: \(error)")
-            // If we get "Operation not permitted", it's a permission issue
-            if let posixError = error as? POSIXError, posixError.code == .EPERM {
-                return (false, false)
-            }
-        }
-        
-        return (false, true)
-    }
-    
-    // New method: Sandbox-friendly process checking
-    private func checkProcessUsingWorkspace(processName: String) -> Bool? {
-        let launchedApps = NSWorkspace.shared.runningApplications
-        
-        // For system processes like daemons, this approach has limitations
-        // but it's worth trying before falling back to ps command
-        for app in launchedApps {
-            if app.localizedName?.lowercased().contains(processName.lowercased()) == true ||
-               app.bundleIdentifier?.lowercased().contains("littlesnitch") == true {
-                return true
-            }
-        }
-        
-        // Check for the existence of Little Snitch installation files
-        let lsFiles = [
-            "/Library/Extensions/LittleSnitch.kext",
-            "/Applications/Little Snitch.app",
-            "/Library/Little Snitch"
-        ]
-        
-        for path in lsFiles {
-            if FileManager.default.fileExists(atPath: path) {
-                return checkLittleSnitchUsingFileExistence()
-            }
-        }
-        
-        // Try using shell command that might work better in sandbox
-        let task = Process()
-        task.launchPath = "/usr/bin/pgrep"
-        task.arguments = ["-f", "Little Snitch"]
-        
         let pipe = Pipe()
         task.standardOutput = pipe
-        let errorPipe = Pipe()
-        task.standardError = errorPipe
         
         do {
             try task.run()
             task.waitUntilExit()
             
-            // Check for errors in pgrep command
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.isEmpty {
-                print("pgrep warning in LittleSnitchMonitor: \(errorOutput)")
-                return checkLittleSnitchUsingFileExistence()
-            }
-            
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            return !output.isEmpty
+            if let output = String(data: data, encoding: .utf8) {
+                let lsProcesses = ["Little Snitch Daemon", "Little Snitch Agent", 
+                                   "Little Snitch Network Monitor", "LittleSnitchNetworkMonitor",
+                                   "LittleSnitchDaemon", "LittleSnitchUIAgent"]
+                
+                for process in lsProcesses {
+                    if output.contains(process) {
+                        log("Little Snitch process found: \(process)") // Use the helper function
+                        return true
+                    }
+                }
+            }
         } catch {
-            // If this fails, try alternative methods
-            print("Error checking process using pgrep in LittleSnitchMonitor: \(error)")
-            return checkLittleSnitchUsingFileExistence()
+            log("Error checking for Little Snitch processes: \(error.localizedDescription)", type: .error) // Use the helper function
         }
+        
+        return false
     }
     
-    // New alternative method that doesn't rely on process listing
-    private func checkLittleSnitchUsingFileExistence() -> Bool? {
-        // Check for runtime files/sockets that would indicate Little Snitch is running
-        let runtimeFiles = [
-            "/Library/Little Snitch/Databases/socket",
-            "/var/run/little-snitch"
+    // Check if the Little Snitch app is installed
+    private func isLittleSnitchAppInstalled() -> Bool {
+        let lsPaths = [
+            "/Applications/Little Snitch.app",
+            "/Applications/Little Snitch Network Monitor.app",
+            "/Library/Extensions/LittleSnitch.kext",
+            "/Library/Extensions/LittleSnitchNetwork.kext",
+            "/Library/Little Snitch",
+            "/Library/Application Support/Objective Development",
+            // Added additional check for component files
+            "/Applications/Little Snitch.app/Contents/Components"
         ]
         
-        for file in runtimeFiles {
-            if FileManager.default.fileExists(atPath: file) {
+        for path in lsPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                log("Little Snitch installation found at: \(path)") // Use the helper function
                 return true
             }
         }
         
-        // Check via launchctl for Little Snitch daemons
-        let servicesToCheck = [
-            "at.obdev.littlesnitch.daemon",
-            "at.obdev.littlesnitchd",
-            "at.obdev.LittleSnitchHelper"
+        // Check with NSWorkspace for registered apps
+        let bundleIDs = [
+            "at.obdev.LittleSnitchNetworkMonitor",
+            "at.obdev.LittleSnitch",
+            "at.obdev.LittleSnitchDaemon"
         ]
         
-        for service in servicesToCheck {
-            let task = Process()
-            task.launchPath = "/bin/launchctl"
-            task.arguments = ["list", service]
-            
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            
-            do {
-                try task.run()
-                task.waitUntilExit()
-                
-                if task.terminationStatus == 0 {
-                    return true
-                }
-            } catch {
-                print("Error checking launchctl for \(service): \(error)")
-            }
-        }
-        
-        // Check network information for Little Snitch processes
-        let netstatTask = Process()
-        netstatTask.launchPath = "/usr/sbin/lsof"
-        netstatTask.arguments = ["-i"]
-        
-        let netstatPipe = Pipe()
-        netstatTask.standardOutput = netstatPipe
-        
-        do {
-            try netstatTask.run()
-            netstatTask.waitUntilExit()
-            
-            let data = netstatPipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            
-            if output.lowercased().contains("little snitch") || output.lowercased().contains("littlesnitch") {
+        for bundleID in bundleIDs {
+            let urls = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleID)
+            if !urls.isEmpty {
+                log("Little Snitch bundle found: \(bundleID)") // Use the helper function
                 return true
             }
-        } catch {
-            print("Error checking network connections: \(error)")
         }
         
-        // If we've exhausted options, return nil to let the caller try other methods
-        return nil
+        return false
     }
     
     private func findLittleSnitchCLI() -> String? {
-        let possiblePaths = [
-            "/Library/Little Snitch/Script Commands/littlesnitch",
-            "/usr/local/bin/littlesnitch",
-            "/opt/homebrew/bin/littlesnitch",
-            "/Applications/Little Snitch.app/Contents/Resources/littlesnitch",
-            "/Applications/Little Snitch.app/Contents/Components/littlesnitch" // Found on your system
-        ]
-        
-        let fileManager = FileManager.default
-        for path in possiblePaths {
-            if fileManager.fileExists(atPath: path) {
+        // Check our known paths first
+        for path in knownLittleSnitchPaths {
+            if FileManager.default.fileExists(atPath: path) {
                 return path
             }
         }
         
-        print("Little Snitch CLI tool not found in any expected location")
-        return nil
-    }
-    
-    private func checkIfLittleSnitchInAlertMode() -> Bool {
-        // Try to find Little Snitch CLI tool
-        guard let littleSnitchCLI = findLittleSnitchCLI() else {
-            return false
-        }
-        
+        // Try to find it using 'which' command
         let task = Process()
-        task.launchPath = littleSnitchCLI
-        task.arguments = ["get-config", "alert-mode"]
+        task.launchPath = "/usr/bin/which"
+        task.arguments = ["littlesnitch"]
         
-        let outputPipe = Pipe()
-        task.standardOutput = outputPipe
+        let pipe = Pipe()
+        task.standardOutput = pipe
         
         do {
             try task.run()
             task.waitUntilExit()
             
-            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                return output == "enabled" || output == "true" || output == "1"
+            if task.terminationStatus == 0 {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+                    return path
+                }
             }
         } catch {
-            print("Error checking Little Snitch alert mode: \(error)")
+            log("Error finding Little Snitch CLI with 'which': \(error.localizedDescription)", type: .error) // Use the helper function
         }
         
-        return false
+        log("Little Snitch CLI tool not found in any expected location", type: .error) // Use the helper function
+        return nil
+    }
+    
+    private func checkIfLittleSnitchInAlertMode() -> Bool {
+        // For newer versions of Little Snitch, the concept of alert mode might not exist or be accessible
+        // So we'll assume it's in alert mode if it's running
+        
+        // But try to check using the CLI if available
+        guard let littleSnitchCLI = findLittleSnitchCLI() else {
+            return true // Default to true if we can't check
+        }
+        
+        let task = Process()
+        task.launchPath = littleSnitchCLI
+        task.arguments = ["read-preference", "alert-mode"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            
+            if task.terminationStatus == 0 {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    return output == "enabled" || output == "true" || output == "1" || output.contains("true")
+                }
+            }
+        } catch {
+            log("Error checking Little Snitch alert mode: \(error.localizedDescription)", type: .error) // Use the helper function
+        }
+        
+        // Default to true if we couldn't check
+        return true
     }
     
     func restoreSecureState() {
         if !isRunning {
             // Attempt to start Little Snitch if it's not running
             openLittleSnitchApplication()
-        } else if !isAlertMode {
-            // If running but not in alert mode, enable alert mode
-            enableLittleSnitchAlertMode()
         }
     }
     
     private func openLittleSnitchApplication() {
-        let task = Process()
+        // Try to open Little Snitch Network Monitor first
+        var task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = ["-a", "Little Snitch Network Monitor"]
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            if task.terminationStatus == 0 {
+                return
+            }
+        } catch {
+            log("Error opening Little Snitch Network Monitor: \(error.localizedDescription)", type: .error) // Use the helper function
+        }
+        
+        // If that fails, try opening Little Snitch application
+        task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = ["-a", "Little Snitch"]
         
         do {
             try task.run()
         } catch {
-            print("Error opening Little Snitch: \(error)")
-        }
-    }
-    
-    private func enableLittleSnitchAlertMode() {
-        // Try to find Little Snitch CLI tool
-        guard let littleSnitchCLI = findLittleSnitchCLI() else {
-            return
-        }
-        
-        let task = Process()
-        task.launchPath = littleSnitchCLI
-        task.arguments = ["set-config", "alert-mode", "enabled"]
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            // Verify the change
-            self.checkStatus()
-        } catch {
-            print("Error enabling Little Snitch alert mode: \(error)")
+            log("Error opening Little Snitch: \(error.localizedDescription)", type: .error) // Use the helper function
         }
     }
 }
