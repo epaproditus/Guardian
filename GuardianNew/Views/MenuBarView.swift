@@ -139,7 +139,7 @@ struct MenuBarView: View {
             }
         }
         .padding()
-        .frame(width: 350) // Increased from 300 to 350 for wider display
+        .frame(width: 350, height: 700) // Added fixed height to ensure enough vertical space
         .environmentObject(securityStatus)
     }
     
@@ -471,7 +471,7 @@ struct SantaRulesView: View {
                     }
                     .padding(.vertical, 5)
                 }
-                .frame(maxHeight: 450) // Slightly reduced to make room for the admin banner
+                .frame(maxHeight: 600) // Increased from 450 to 600 for better visibility
             }
         }
         .onAppear {
@@ -757,7 +757,7 @@ struct ProfilesDetailView: View {
                     }
                     .padding(.vertical, 5)
                 }
-                .frame(maxHeight: 300) // Increased from 200 to 300 for taller display
+                .frame(maxHeight: 600) // Increased from 300 to 600 for better visibility
             }
         }
         .onAppear {
